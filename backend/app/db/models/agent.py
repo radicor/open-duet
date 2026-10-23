@@ -73,6 +73,21 @@ class Agent(Base):
     recall_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default=expression.true()
     )
+    # Off: no model call files facts noticed in this agent's conversations
+    # (docs/MEMORY.md, "Noticing facts"). Needs memory_enabled.
+    memory_upkeep: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=expression.true()
+    )
+    # Off: a long conversation that is folded keeps the excerpt summary and no
+    # model writes one (docs/MEMORY.md, "Context compaction").
+    compaction_summary: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=expression.true()
+    )
+    # Off: the helper model (docs/MEMORY.md) never writes this agent's background
+    # texts, whatever the installation's helper setting.
+    use_helper: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=expression.true()
+    )
     # Pinned agents list first.
     pinned: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=expression.false()

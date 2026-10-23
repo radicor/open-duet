@@ -93,6 +93,8 @@ class Settings(BaseSettings):
     LOCAL_WORKSPACE_ROOT: str = ""
     TEAM_ENABLED: bool = True
     TEAM_LEAD_AUTO: bool = True
+    # Teammates may flag a gate only the person can lift (app/team/notices.py). Off by default.
+    TEAM_ESCALATIONS: bool = False
     TEAM_MAX_CREATED_PER_TURN: int = 4
     TEAM_MAX_AGENTS: int = 50
     TEAM_MAX_DEPTH: int = 3
@@ -100,8 +102,10 @@ class Settings(BaseSettings):
     TEAM_MAX_JOBS_PER_ROOT: int = 24
     TEAM_MAX_EXECUTIONS_PER_ROOT: int = 48
     TEAM_MAX_PARALLEL: int = 3
-    TEAM_JOB_WAIT_SECONDS: int = 900
+    TEAM_JOB_WAIT_SECONDS: int = 300
     TEAM_JOB_QUEUE_SECONDS: int = 600
+    TEAM_DELEGATE_QUEUE_SECONDS: int = 86400
+    TEAM_QUESTION_WAIT_SECONDS: int = 1800
     ROOM_CHAIN_DEPTH: int = 2
     LOCAL_TASK_TIMEOUT_SECONDS: int = 300
     LOCAL_MAX_OUTPUT_BYTES: int = 1_000_000
@@ -151,6 +155,30 @@ class Settings(BaseSettings):
     # (AnyIO's default 40). Turns past the cap wait their turn instead of
     # starving routine scheduling, task sync and computer upkeep.
     TURN_MAX_CONCURRENT: int = 16
+    # Memory upkeep (docs/MEMORY.md): a conversation with an agent that has been
+    # quiet for this many seconds (or has had 6 turns) is read once by a quick
+    # model call that files the facts worth keeping. 0 switches the call off for
+    # every agent.
+    MEMORY_CAPTURE_QUIET_SECONDS: float = 120
+    # Optional smaller model for those calls, per engine: "claude=haiku,openai_compat=llama3".
+    # An engine not listed uses "haiku" on Claude, and the endpoint's own model elsewhere.
+    # The call always goes to the engine the conversation already uses.
+    MEMORY_HELPER_MODEL: str = ""
+    # Compaction of a replayed conversation (docs/MEMORY.md): on by default, the
+    # engine the conversation already uses writes the summary of the folded part when
+    # it has a quick call (the folded text is redacted first, 20 seconds at most, a
+    # failure keeps the excerpt summary). False switches it off for every agent.
+    COMPACTION_MODEL_SUMMARY: bool = True
+    # The helper model (docs/MEMORY.md): one connected engine (and, optionally, one
+    # of its models) that writes the background texts an agent's own engine cannot
+    # (Codex and ACP agents). Unset means no helper, so nothing new leaves the
+    # agent's own provider. The environment wins over the Memory settings; an empty
+    # HELPER_ENGINE switches a saved helper off.
+    HELPER_ENGINE: str | None = None
+    HELPER_MODEL: str | None = None
+    # The nightly tidy-up runs once a day after this local hour (0-23) for each
+    # agent with notes and upkeep on, never while it is working. 24 switches it off.
+    MEMORY_TIDY_HOUR: int = 3
 
     # Routines (docs/ROUTINES.md): how often the scheduler looks for due and
     # finished runs, the largest webhook body accepted, and an optional

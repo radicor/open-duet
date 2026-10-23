@@ -29,7 +29,7 @@ from app.computers import grants
 from app.computers.service import COMPUTER_TOOL_PREFIX
 from app.core import app_settings
 from app.core.logging import get_logger
-from app.services import engine_errors, local_claude_runner
+from app.services import engine_errors, local_claude_runner, memory_bridge
 from app.services.local_approval_broker import (
     DENY_BY_USER,
     DENY_CANCELLED,
@@ -78,7 +78,7 @@ _KINDS = {
 from app.computers.policy import SCREEN_INPUT, SCREEN_READ
 _KINDS.update({tool: "screen_input" for tool in SCREEN_INPUT})
 _KINDS.update({tool: "screen_read" for tool in SCREEN_READ})
-_KINDS.update({"mcp__team__ask_agent": "delegate", "mcp__team__create_agent": "create_agent", "mcp__team__say_in_room": "room_post"})
+_KINDS.update({"mcp__team__ask_agent": "delegate", "mcp__team__delegate": "delegate", "mcp__team__create_agent": "create_agent", "mcp__team__say_in_room": "room_post"})
 
 DENY_NO_PERMIT = "The approval could not be handed to the computer, so this action was not allowed."
 
@@ -120,14 +120,19 @@ class _Attempt:
         )
 
 
-def _issue_permit(ctx: TurnContext, handle: ApprovalHandle, tool_input: dict) -> bool:
+def _issue_permit(ctx: TurnContext, handle: ApprovalHandle, tool_input: dict, native_epoch: int | None = None) -> bool:
     """For an allowed computer call, the one-use permit the computer's MCP
     server must find before it runs the call. Other calls need none."""
     tool = getattr(handle, "tool", None) or ""
     if ctx.computer is None or not tool.startswith(COMPUTER_TOOL_PREFIX):
         return True
     try:
-        grants.issue(ctx.computer.grants_dir, tool[len(COMPUTER_TOOL_PREFIX):], tool_input)
+        file = grants.issue(ctx.computer.grants_dir, tool[len(COMPUTER_TOOL_PREFIX):], tool_input)
+        if getattr(ctx.computer, "provider", None) == "native":
+            if native_epoch is None:
+                file.unlink(missing_ok=True)
+                return False
+            file.write_text(json.dumps({"generation": native_epoch, "tool": tool[len(COMPUTER_TOOL_PREFIX):], "arguments": tool_input}), encoding="utf-8")
         return True
     except OSError:
         logger.exception("could not write a computer permit", thread_id=ctx.thread_id)
@@ -171,6 +176,49 @@ class ClaudeAdapter:
             signed_in=cli.signed_in,
         )
 
+    async def generate_text(
+        self, prompt: str, *, config: dict | None = None, model: str | None = None, timeout: float = 60,
+        on_usage=None,
+    ) -> str:
+        """One quick answer to `prompt` for background work (memory upkeep),
+        from the same CLI and sign-in as the agent's own turns. No tools, no
+        MCP servers, no session saved, started in a new empty folder; the
+        prompt goes in on stdin. Raises RuntimeError when the CLI fails or does
+        not answer in time."""
+        import tempfile
+        from pathlib import Path
+
+        from fastapi.concurrency import run_in_threadpool
+
+        executable = local_claude_runner.resolve_claude_executable()
+        if executable is None:
+            raise RuntimeError("The Claude CLI was not found.")
+        args = [
+            str(executable), "-p", "--output-format", "text", "--no-session-persistence",
+            *local_claude_runner.LOCKDOWN_ARGS,
+        ]
+        if model:
+            args += ["--model", model]
+
+        control = local_claude_runner.RunControl()
+
+        def call() -> local_claude_runner.RunOutput:
+            with tempfile.TemporaryDirectory(prefix="open-dots-helper-") as empty:
+                return local_claude_runner.run_blocking(
+                    args, stdin_text=prompt, cwd=Path(empty), timeout_seconds=timeout,
+                    max_output_bytes=256 * 1024, control=control, keep_stdin_open=False,
+                )
+
+        try:
+            out = await run_in_threadpool(call)
+        except asyncio.CancelledError:
+            # A timeout or a Stop cancels the call: the process goes with it.
+            control.kill()
+            raise
+        if out.exit_code != 0 or not out.stdout.strip():
+            raise RuntimeError("The Claude CLI gave no answer for the background call.")
+        return out.stdout
+
     async def run_turn(
         self, ctx: TurnContext, sink: EventSink, gate: ApprovalGate
     ) -> TurnOutcome:
@@ -180,10 +228,14 @@ class ClaudeAdapter:
             )
         # A computer is the agent's sandbox: its turns always have tools, and
         # they are the computer's tools only.
-        tools = app_settings.get("LOCAL_TOOLS_ENABLED") or ctx.computer is not None or ctx.team_launch is not None
-        attempt = await self._attempt(ctx, sink, gate, resume=ctx.resume, tools=tools)
+        host_tools = app_settings.get("LOCAL_TOOLS_ENABLED") or ctx.computer is not None or ctx.team_launch is not None
+        # The memory search is an MCP tool asked about like any other: the turn
+        # then runs with approvals, but with the host's own tools off unless
+        # they were on already.
+        tools = host_tools or ctx.memory_launch is not None
+        attempt = await self._attempt(ctx, sink, gate, resume=ctx.resume, tools=tools, host_tools=host_tools)
         if attempt.already_in_use and not attempt.resume and not ctx.aborted:
-            attempt = await self._attempt(ctx, sink, gate, resume=True, tools=tools)
+            attempt = await self._attempt(ctx, sink, gate, resume=True, tools=tools, host_tools=host_tools)
         return self._outcome(ctx, attempt, tools=tools)
 
     # -- one launch ------------------------------------------------------------
@@ -196,6 +248,7 @@ class ClaudeAdapter:
         *,
         resume: bool,
         tools: bool,
+        host_tools: bool = True,
     ) -> _Attempt:
         loop = asyncio.get_running_loop()
         normalizer = StreamNormalizer(max_text_bytes=app_settings.get("LOCAL_MAX_OUTPUT_BYTES"))
@@ -209,6 +262,8 @@ class ClaudeAdapter:
         queue: asyncio.Queue = asyncio.Queue()
         answering: set[asyncio.Task] = set()
         tools_by_request: dict[str, str] = {}
+        native_calls: set[str] = set()
+        native_epochs: dict[str, int] = {}
 
         def on_line(line: bytes) -> bool:
             # Runs on the runner's reader thread. Everything it learns goes onto
@@ -233,7 +288,7 @@ class ClaudeAdapter:
                 control.resume_deadline()
             if decision.kind == LOST:
                 return
-            if decision.kind == ALLOW and not _issue_permit(ctx, handle, tool_input):
+            if decision.kind == ALLOW and not _issue_permit(ctx, handle, tool_input, native_epochs.get(handle.request_id)):
                 payload = _deny_payload(handle.request_id, DENY_NO_PERMIT)
             elif decision.kind == ALLOW:
                 payload = _allow_payload(handle.request_id, tool_input)
@@ -247,17 +302,23 @@ class ClaudeAdapter:
         async def handle_tool_event(event: ToolEvent) -> None:
             data = event.data
             if event.kind == "tool_started":
+                from app.computers.native import durable_input
+                native = data["tool"].startswith("mcp__computer__native_")
+                if native:
+                    native_calls.add(data["tool_use_id"])
                 await sink.emit(
                     "tool.started",
                     {
                         "call_id": data["tool_use_id"],
                         "name": data["tool"],
-                        "summary": data["summary"],
-                        "input": event.extra.get("input", {}),
+                        "summary": data["tool"].removeprefix("mcp__computer__native_").replace("_", " ") + " on this Mac" if native else data["summary"],
+                        "input": durable_input(data["tool"], event.extra.get("input", {})),
                     },
                 )
             elif event.kind == "tool_completed":
                 output, truncated = cap_tool_output(event.extra.get("output", ""))
+                if data["tool_use_id"] in native_calls:
+                    output, truncated = "Native desktop result omitted from history for privacy.", False
                 await sink.emit(
                     "tool.completed",
                     {
@@ -293,6 +354,15 @@ class ClaudeAdapter:
                 control.send(json.dumps(_deny_payload(request_id, DENY_TOO_LARGE)))
                 return
             tools_by_request[request_id] = tool
+            if ctx.computer is not None and getattr(ctx.computer, "provider", None) == "native":
+                from app.computers.native import request
+                try:
+                    connection = json.loads((ctx.computer.grants_dir / "connection.json").read_text())
+                    epoch = await asyncio.to_thread(request, connection, {"method": "epoch"})
+                    native_epochs[request_id] = epoch["generation"]
+                except Exception:
+                    control.send(json.dumps(_deny_payload(request_id, DENY_NO_PERMIT)))
+                    return
             # Recorded here, in stream order, so the approval appears after the
             # tool call that caused it; the wait happens in its own task.
             handle = await gate.open(
@@ -335,8 +405,17 @@ class ClaudeAdapter:
         if ctx.computer is not None:
             notes.append(ctx.computer.prompt_note())
             extra["computer"] = ctx.computer.launch
+        servers = {}
         if ctx.team_launch is not None:
-            extra["mcp_servers"] = {"team": ctx.team_launch}
+            servers["team"] = ctx.team_launch
+        if ctx.memory_launch is not None:
+            servers["memory"] = ctx.memory_launch
+            notes.append(memory_bridge.TOOL_NOTE)
+        if servers:
+            extra["mcp_servers"] = servers
+            if not host_tools:
+                # Only the memory search is wanted: the host's own tools stay off.
+                extra["mcp_only"] = True
         if notes:
             extra["system_prompt"] = "\n\n".join(notes)
         if ctx.images:

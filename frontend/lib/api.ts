@@ -1,3 +1,5 @@
+import type { SkillDoc, SkillPreview, SkillSave, SkillSummary } from "./skills";
+import type { TemplateCatalog, TemplateSkill } from "./templates";
 const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000/api/v1";
 
@@ -423,6 +425,7 @@ export type Computer = ComputerSummary & {
   pids_limit: number;
   idle_minutes: number;
   auto_start: boolean;
+  browser_enabled: boolean;
   // What Docker reports now; null when it was not asked or cannot be reached.
   live_state: string | null;
   needs_recreate: boolean;
@@ -445,6 +448,7 @@ export type ComputerSettings = {
   network?: ComputerNetwork;
   idle_minutes?: number;
   auto_start?: boolean;
+  browser_enabled?: boolean;
 };
 
 // A named agent: instructions, model, workspace and how much it asks first.
@@ -465,6 +469,10 @@ export type Agent = {
   memory_enabled?: boolean;
   // Off: no notes or earlier conversations are recalled before a turn.
   recall_enabled?: boolean;
+  // Off: no quick model call files facts noticed in its conversations.
+  memory_upkeep?: boolean;
+  compaction_summary?: boolean;
+  use_helper?: boolean;
   // Another engine (and model) a turn moves to when this agent's engine
   // refuses it for a limit before starting on it (docs/ENGINES.md).
   fallback_provider?: string | null;
@@ -489,6 +497,9 @@ export type AgentInput = {
   pinned?: boolean;
   memory_enabled?: boolean;
   recall_enabled?: boolean;
+  memory_upkeep?: boolean;
+  compaction_summary?: boolean;
+  use_helper?: boolean;
   fallback_provider?: string | null;
   fallback_model?: string | null;
   // Create only: the first contents of the agent's notes.
@@ -519,6 +530,7 @@ export type Engine = {
   custom_models: boolean;
   capabilities: { tools: boolean; approvals: boolean; mcp: boolean; images: boolean; resume: boolean; computers: boolean };
   configurable: boolean;
+  can_write_text?: boolean;
   config: Record<string, unknown> | null;
   preset?: boolean;
   setup?: { install?: string | null; sign_in?: string | null; docs_url?: string | null; credential?: string; notes?: string[] } | null;
@@ -560,6 +572,8 @@ export type MemoryJournalRow = {
   at: string;
   path: string;
   actor: string;
+  // For upkeep rows, the step that wrote it.
+  via?: string | null;
   kind: "created" | "edited" | "deleted";
   before_hash: string | null;
   after_hash: string | null;
@@ -569,6 +583,42 @@ export type MemoryJournalRow = {
   can_undo: boolean;
   reason: string | null;
 };
+export type MemoryJournalVia = "capture" | "tidy" | "organize";
+export type TidyReport = {
+  at: number;
+  expired: number;
+  duplicates: number;
+  superseded: number;
+  deferred: number;
+  organized: number;
+  note: string | null;
+};
+export type CaptureReport = { at: number; added: number; topics: number; about_me?: number; note: string | null; via?: "engine" | "helper" | null };
+export type MemoryUpkeepStatus = {
+  enabled: boolean;
+  engine_can_call: boolean;
+  engine?: string;
+  quiet_seconds: number;
+  last_capture: CaptureReport | null;
+  last_tidy: TidyReport | null;
+  tidy_hour: number;
+  helper_model?: string | null;
+  // The helper model (docs/MEMORY.md): another engine that writes the texts this agent's own engine cannot.
+  helper?: { engine: string; label: string; model: string | null; source: "environment" | "settings"; usable: boolean } | null;
+  // True when the helper is in use for this agent now (its own engine has no quick call, the agent allows it).
+  helper_used?: boolean;
+};
+// Installation-wide: the same for every agent.
+export type MemorySettings = {
+  learn_from_rooms: boolean;
+  tidy_hour: number;
+  helper_models: Record<string, string>;
+  // The saved helper, and the one in force (the environment can set or switch it off).
+  helper?: { engine: string; model: string } | null;
+  helper_active?: { engine: string; model: string | null; source: "environment" | "settings" } | null;
+};
+export type LearnedFact = { id: string; text: string; line: string; agent_id: number | null; agent_name: string; at: number };
+export type AboutMe = { text: string; hash: string; learned: LearnedFact[]; max_chars: number; redacted?: number };
 export type MemoryProposal = {
   id: string;
   at: string;
@@ -594,6 +644,9 @@ export type AgentMemory = {
   max_lines: number;
   max_bytes: number;
   enabled: boolean;
+  // Entries past their `until` day: not loaded, still in the file (and their lines).
+  expired?: number;
+  expired_lines?: number;
   // After a save: how many things that looked like secrets were replaced.
   redacted: number;
 };
@@ -604,6 +657,8 @@ export type AgentExport = {
   file_name: string;
   document: Record<string, unknown>;
   redacted: string[];
+  // Topic notes left out because the file would be too large.
+  skipped?: string[];
 };
 
 export type Thread = {
@@ -920,6 +975,17 @@ export const api = {
   updateAgent: (agentId: number, change: Partial<AgentInput> & { archived?: boolean }) =>
     request<Agent>(`/agents/${agentId}`, { method: "PATCH", body: JSON.stringify(change) }),
 
+  // Ready-made agents (/templates): a bundled, read-only catalog.
+  listTemplates: () => request<TemplateCatalog>("/templates"),
+
+  // A template's suggested skill, saved on the new agent after it exists. An older
+  // backend with no skills library answers 404.
+  installTemplateSkill: (agentId: number, templateId: string, skill: TemplateSkill) =>
+    request<unknown>(`/agents/${agentId}/skills/${encodeURIComponent(skill.name)}`, {
+      method: "PUT",
+      body: JSON.stringify({ description: skill.description, body: skill.body, enabled: true, source: `template:${templateId}` }),
+    }),
+
   deleteAgent: (agentId: number) => request<void>(`/agents/${agentId}`, { method: "DELETE" }),
 
   // A copy with the same settings, named "<name> copy". Notes are not copied.
@@ -957,6 +1023,30 @@ export const api = {
     request<MemoryJournalRow | null>(`/agents/${agentId}/memory/journal/${encodeURIComponent(entryId)}/undo`, {
       method: "POST",
     }),
+
+  // Organize, expire, de-duplicate and reconcile contradictions now (409 while
+  // the agent is working or upkeep is off).
+  tidyAgentMemory: (agentId: number) =>
+    request<TidyReport>(`/agents/${agentId}/memory/tidy`, { method: "POST" }),
+
+  memoryUpkeep: (agentId: number) => request<MemoryUpkeepStatus>(`/agents/${agentId}/memory/upkeep`),
+
+  memorySettings: () => request<MemorySettings>("/memory/settings"),
+
+  saveMemorySettings: (change: Partial<MemorySettings>) =>
+    request<MemorySettings>("/memory/settings", { method: "PUT", body: JSON.stringify(change) }),
+
+  aboutMe: () => request<AboutMe>("/memory/about-me"),
+
+  // `expectedHash` is the hash of the text that was opened; a stale one is a 409 (code memory_changed).
+  saveAboutMe: (text: string, expectedHash: string | null) =>
+    request<AboutMe>("/memory/about-me", {
+      method: "PUT",
+      body: JSON.stringify(expectedHash ? { text, expected_hash: expectedHash } : { text }),
+    }),
+
+  removeLearnedFact: (id: string) =>
+    request<AboutMe>(`/memory/about-me/learned/${encodeURIComponent(id)}`, { method: "DELETE" }),
 
   memoryProposals: (agentId: number) => request<MemoryProposal[]>(`/agents/${agentId}/memory/proposals`),
 
@@ -1011,16 +1101,31 @@ export const api = {
   deleteComputer: (computerId: number) =>
     request<{ removed: boolean }>(`/computers/${computerId}`, { method: "DELETE" }),
 
+  // An agent's saved skills (docs/SKILLS.md). Preview reads a pasted SKILL.md and saves nothing.
+  listSkills: (agentId: number) => request<SkillSummary[]>(`/agents/${agentId}/skills`),
+  getSkill: (agentId: number, name: string) =>
+    request<SkillDoc>(`/agents/${agentId}/skills/${encodeURIComponent(name)}`),
+  saveSkill: (agentId: number, name: string, body: SkillSave) =>
+    request<SkillDoc>(`/agents/${agentId}/skills/${encodeURIComponent(name)}`, { method: "PUT", body: JSON.stringify(body) }),
+  deleteSkill: (agentId: number, name: string) =>
+    request<void>(`/agents/${agentId}/skills/${encodeURIComponent(name)}`, { method: "DELETE" }),
+  previewSkill: (agentId: number, markdown: string) =>
+    request<SkillPreview>(`/agents/${agentId}/skills/import`, { method: "POST", body: JSON.stringify({ markdown }) }),
+
   // 202 once the turn has started; its answer arrives on the stream. Errors with
   // a code: turn_running, session_broken, provider_unavailable (see ApiError.code).
   // `attachmentIds` from uploadAttachment. 422 images_unsupported: this
   // conversation's engine cannot read images.
-  sendTurn: (threadId: number, promptText: string, attachmentIds: string[] = []) =>
+  // `skills`: names of the agent's enabled skills the person picked for this message
+  // (at most 3); 422 skill_unavailable when one is missing or off.
+  sendTurn: (threadId: number, promptText: string, attachmentIds: string[] = [], skills: string[] = []) =>
     request<ThreadTurn>(`/threads/${threadId}/turns`, {
       method: "POST",
-      body: JSON.stringify(
-        attachmentIds.length ? { prompt_text: promptText, attachment_ids: attachmentIds } : { prompt_text: promptText }
-      ),
+      body: JSON.stringify({
+        prompt_text: promptText,
+        ...(attachmentIds.length ? { attachment_ids: attachmentIds } : {}),
+        ...(skills.length ? { skills } : {}),
+      }),
     }),
 
   // Stop the running answer. 202 once Claude was told to stop; the end arrives as
@@ -1279,6 +1384,17 @@ export type UsageSummary = {
   by_thread: UsageTotals[];
   by_engine: UsageTotals[];
   by_day: UsageTotals[];
+  // Calls the helper model made (docs/MEMORY.md): when none was set, calls is 0.
+  helper?: HelperUsage;
+};
+
+export type HelperUsage = {
+  calls: number;
+  failed: number;
+  reported_calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  groups: { engine: string; model: string; job: string; agent: string; calls: number; failed: number; input_tokens: number; output_tokens: number }[];
 };
 
 async function errorFrom(res: Response): Promise<ApiError> {

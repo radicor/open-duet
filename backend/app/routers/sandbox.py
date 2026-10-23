@@ -1,3 +1,5 @@
+import json
+
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -38,6 +40,13 @@ router = APIRouter(
     prefix="/sandboxes",
     tags=["Sandboxes"],
 )
+
+
+async def known_box(box_id: str, db: AsyncSession = Depends(get_db)):
+    """A box id only reaches a box this app created and recorded."""
+    if await user_sandbox_service.get_by_box_id(db, box_id) is None:
+        raise HTTPException(status_code=404, detail="Sandbox not found")
+    return box_id
 
 
 @router.post("", response_model=SandboxResponse)
@@ -113,6 +122,7 @@ def health_check():
     return {"status": "healthy"}
 
 
+
 async def owned_box(
     box_id: str,
     db: AsyncSession = Depends(get_db),
@@ -127,7 +137,7 @@ async def owned_box(
     return record
 
 
-@router.get("/{box_id}", response_model=SandboxResponse)
+@router.get("/{box_id}", response_model=SandboxResponse, dependencies=[Depends(known_box)])
 async def get_sandbox(box_id: str, db: AsyncSession = Depends(get_db), _=Depends(owned_box)):
     try:
         result = await run_in_threadpool(
@@ -158,7 +168,8 @@ async def get_sandbox(box_id: str, db: AsyncSession = Depends(get_db), _=Depends
         )
 
 
-@router.post("/{box_id}/stop")
+
+@router.post("/{box_id}/stop", dependencies=[Depends(known_box)])
 async def stop_sandbox(box_id: str, db: AsyncSession = Depends(get_db), _=Depends(owned_box)):
     try:
         result = await run_in_threadpool(
@@ -182,7 +193,8 @@ async def stop_sandbox(box_id: str, db: AsyncSession = Depends(get_db), _=Depend
         )
 
 
-@router.post("/{box_id}/resume", response_model=SandboxResponse)
+
+@router.post("/{box_id}/resume", response_model=SandboxResponse, dependencies=[Depends(known_box)])
 async def resume_sandbox(box_id: str, db: AsyncSession = Depends(get_db), _=Depends(owned_box)):
     try:
         result = await run_in_threadpool(
@@ -212,7 +224,42 @@ async def resume_sandbox(box_id: str, db: AsyncSession = Depends(get_db), _=Depe
             detail=f"ASCII error: {exc.reason}",
         )
 
-@router.post("/{box_id}/auth/{provider}/start", response_model=AuthLoginStartResponse)
+
+
+@router.post("/{box_id}/test-command", dependencies=[Depends(known_box)])
+async def test_command(box_id: str, _=Depends(owned_box)):
+    result = await run_in_threadpool(
+        ascii_box_service.run_command,
+        box_id,
+        'claude auth status',
+        #'tmux new-session -d -s claude_auth -x 500 -y 50 "claude auth login"'
+    )
+
+    logger.info(f"Command result: {result.to_json()}")
+    parsed_result = json.loads(result.to_json())
+
+    return {
+        "stdout": parsed_result.get("stdout"),
+        "stderr": parsed_result.get("stderr"),
+        "exit_code": parsed_result.get("exit_code"),
+        "success": parsed_result.get("success"),
+    }
+
+
+@router.post("/{box_id}/test-write-file", dependencies=[Depends(known_box)])
+async def test_write_file(box_id: str, payload: dict, _=Depends(owned_box)):
+    result = await run_in_threadpool(
+        ascii_box_service.write_file,
+        box_id,
+        payload["path"],
+        payload["content"],
+    )
+
+    return result.to_dict()
+
+
+
+@router.post("/{box_id}/auth/{provider}/start", response_model=AuthLoginStartResponse, dependencies=[Depends(known_box)])
 async def start_auth_login(box_id: str, provider: str, _=Depends(owned_box)):
     try:
         login_url = await run_in_threadpool(
@@ -231,7 +278,9 @@ async def start_auth_login(box_id: str, provider: str, _=Depends(owned_box)):
 
 
 @router.post(
-    "/{box_id}/auth/{provider}/device/start", response_model=DeviceLoginStartResponse
+    "/{box_id}/auth/{provider}/device/start",
+    response_model=DeviceLoginStartResponse,
+    dependencies=[Depends(known_box)],
 )
 async def start_device_auth_login(box_id: str, provider: str, _=Depends(owned_box)):
     """Starts a device-flow login (GitHub) — returns a URL + one-time code
@@ -327,7 +376,8 @@ async def submit_auth_login(
         raise HTTPException(status_code=504, detail=str(exc))
 
 
-@router.delete("/{box_id}")
+
+@router.delete("/{box_id}", dependencies=[Depends(known_box)])
 async def delete_sandbox(box_id: str, db: AsyncSession = Depends(get_db), _=Depends(owned_box)):
     try:
         await run_in_threadpool(

@@ -31,6 +31,9 @@ _EDITABLE = (
     "pinned",
     "memory_enabled",
     "recall_enabled",
+    "memory_upkeep",
+    "compaction_summary",
+    "use_helper",
     "fallback_provider",
     "fallback_model",
 )
@@ -83,6 +86,9 @@ async def create_agent(
     pinned: bool = False,
     memory_enabled: bool = True,
     recall_enabled: bool = True,
+    memory_upkeep: bool = True,
+    compaction_summary: bool = True,
+    use_helper: bool = True,
     fallback_provider: str | None = None,
     fallback_model: str | None = None,
 ) -> Agent:
@@ -106,6 +112,9 @@ async def create_agent(
         pinned=pinned,
         memory_enabled=memory_enabled,
         recall_enabled=recall_enabled,
+        memory_upkeep=memory_upkeep,
+        compaction_summary=compaction_summary,
+        use_helper=use_helper,
         fallback_provider=fallback_provider,
         fallback_model=fallback_model,
         created_at=now,
@@ -142,8 +151,13 @@ async def update_agent(
         raise AgentNotFound(agent_id)
     for field, value in changes.items():
         setattr(agent, field, value)
+    if "instructions" in changes:
+        # The person wrote or looked at these instructions.
+        agent.instructions_reviewed_at = _utcnow()
     if archived is not None:
         agent.archived_at = _utcnow() if archived else None
+        if archived:
+            await _leave_team(db, agent)
     agent.updated_at = _utcnow()
     name = agent.name  # read now: after a rollback the row is expired
     try:
@@ -199,9 +213,25 @@ async def duplicate_agent(db: AsyncSession, agent_id: int) -> Agent:
         approval_mode=source.approval_mode,
         memory_enabled=source.memory_enabled,
         recall_enabled=source.recall_enabled,
+        memory_upkeep=source.memory_upkeep,
+        compaction_summary=source.compaction_summary,
+        use_helper=source.use_helper,
         fallback_provider=source.fallback_provider,
         fallback_model=source.fallback_model,
     )
+
+
+async def _leave_team(db: AsyncSession, agent: Agent) -> None:
+    """An agent that goes away stops leading and belonging to its team, so the
+    team never points at a missing lead."""
+    if agent.team_id is None:
+        return
+    from app.db.models import Team
+    team = await db.get(Team, agent.team_id, with_for_update=True)
+    if team is not None and team.lead_agent_id == agent.id:
+        team.lead_agent_id = None
+        team.updated_at = _utcnow()
+    agent.team_id = None
 
 
 async def delete_agent(db: AsyncSession, agent_id: int) -> None:
@@ -222,6 +252,7 @@ async def delete_agent(db: AsyncSession, agent_id: int) -> None:
     if agent is None:
         await db.rollback()
         raise AgentNotFound(agent_id)
+    await _leave_team(db, agent)
     await db.execute(
         update(Team)
         .where(Team.lead_agent_id == agent_id)

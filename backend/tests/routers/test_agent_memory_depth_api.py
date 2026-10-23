@@ -2,7 +2,7 @@
 child process playing the Claude CLI (docs/MEMORY.md)."""
 
 from app.auth import policy
-from app.services import memory_proposals, memory_recall, memory_topics
+from app.services import memory_log, memory_proposals, memory_recall, memory_topics
 from tests.routers.test_agents_api import (  # noqa: F401
     agent_cleanup,
     api,
@@ -116,6 +116,88 @@ async def test_recall_switch_is_on_by_default_and_copied(api):
     assert (await api.patch(f"/api/v1/agents/{agent['id']}", json={"recall_enabled": None})).status_code == 422
 
 
+async def test_upkeep_switch_is_on_by_default_copied_and_reported(api):
+    agent = await make(api)
+    assert agent["memory_upkeep"] is True
+    off = await make(api, memory_upkeep=False)
+    assert (await api.post(f"/api/v1/agents/{off['id']}/duplicate")).json()["memory_upkeep"] is False
+    assert (await api.patch(f"/api/v1/agents/{agent['id']}", json={"memory_upkeep": None})).status_code == 422
+    status = (await api.get(f"/api/v1/agents/{agent['id']}/memory/upkeep")).json()
+    assert status["enabled"] is True and status["last_capture"] is None and status["engine_can_call"] is True
+    await api.patch(f"/api/v1/agents/{agent['id']}", json={"memory_upkeep": False})
+    assert (await api.get(f"/api/v1/agents/{agent['id']}/memory/upkeep")).json()["enabled"] is False
+
+
+async def test_daily_logs_are_listed_read_and_deleted(api):
+    agent = await make(api)
+    base = f"/api/v1/agents/{agent['id']}/memory/logs"
+    assert (await api.get(base)).json() == {"logs": []}
+    memory_log.append(agent["id"], "Sent the invoices", source='chat "A"')
+    (item,) = (await api.get(base)).json()["logs"]
+    text = (await api.get(f"{base}/{item['day']}")).json()["text"]
+    assert "Sent the invoices" in text
+    assert (await api.get(f"{base}/..%2Fx")).status_code in (404, 422)
+    assert (await api.get(f"{base}/2020-01-01")).status_code == 404
+    assert (await api.delete(f"{base}/{item['day']}")).status_code == 204
+    assert (await api.delete(f"{base}/{item['day']}")).status_code == 404
+
+
+async def test_tidy_now_reports_and_is_refused_when_upkeep_is_off(api):
+    agent = await make(api)
+    done = await api.post(f"/api/v1/agents/{agent['id']}/memory/tidy")
+    assert done.status_code == 200 and {"expired", "duplicates", "superseded", "organized"} <= set(done.json())
+    assert (await api.get(f"/api/v1/agents/{agent['id']}/memory/upkeep")).json()["last_tidy"] is not None
+    off = await make(api, memory_upkeep=False)
+    refused = await api.post(f"/api/v1/agents/{off['id']}/memory/tidy")
+    assert refused.status_code == 409 and code_of(refused) == "upkeep_off"
+
+
+async def test_topic_notes_travel_in_an_agent_file(api):
+    agent = await make(api, starter_notes="- 2026-10-01 · likes tea\n")
+    memory_topics.write_topic(agent["id"], "travel.md", "---\ntitle: Travel\naliases: [trips]\n---\n- aisle seats\n- token=abcdef123456\n")
+    memory_topics.write_topic(agent["id"], "archive.md", "- old\n")
+    exported = (await api.get(f"/api/v1/agents/{agent['id']}/export", params={"include_notes": "true"})).json()
+    assert list(exported["document"]["notes"]["topics"]) == ["travel.md"]  # never the archive
+    assert "abcdef123456" not in exported["document"]["notes"]["topics"]["travel.md"]
+    bare = (await api.get(f"/api/v1/agents/{agent['id']}/export")).json()
+    assert "notes" not in bare["document"]
+    copy = (await api.post("/api/v1/agents/import", json={"document": exported["document"]})).json()
+    assert "aisle seats" in memory_topics.read_topic(copy["id"], "travel.md").text
+    assert not memory_topics.read_topic(copy["id"], "archive.md").exists
+    plain = (await api.post("/api/v1/agents/import", json={"document": exported["document"], "include_notes": False})).json()
+    assert memory_topics.list_topics(plain["id"]) == []
+    bad = {**exported["document"], "notes": {"topics": {"../x.md": "boo"}}}
+    assert (await api.post("/api/v1/agents/import", json={"document": bad})).status_code == 422
+    bad = {**exported["document"], "notes": {"topics": {"archive.md": "boo"}}}
+    assert (await api.post("/api/v1/agents/import", json={"document": bad})).status_code == 422
+
+
+async def test_an_import_is_journaled_and_can_be_undone(api):
+    agent = await make(api, starter_notes="- main\n")
+    memory_topics.write_topic(agent["id"], "travel.md", "- Lisbon in May\n")
+    document = (await api.get(f"/api/v1/agents/{agent['id']}/export", params={"include_notes": "true"})).json()["document"]
+    copy = (await api.post("/api/v1/agents/import", json={"document": document})).json()
+    rows = (await api.get(f"/api/v1/agents/{copy['id']}/memory/journal")).json()
+    assert {(r["path"], r["actor"], r["kind"]) for r in rows} == {
+        ("MEMORY.md", "import", "created"),
+        ("memory/travel.md", "import", "created"),
+    }
+    row = next(r for r in rows if r["path"] == "memory/travel.md")
+    assert (await api.post(f"/api/v1/agents/{copy['id']}/memory/journal/{row['id']}/undo")).status_code == 200
+    assert not memory_topics.read_topic(copy["id"], "travel.md").exists
+    plain = (await api.post("/api/v1/agents/import", json={"document": document, "include_notes": False})).json()
+    assert (await api.get(f"/api/v1/agents/{plain['id']}/memory/journal")).json() == []
+
+
+async def test_an_export_lists_the_topic_notes_it_had_to_leave_out(api):
+    agent = await make(api)
+    for i in range(11):
+        memory_topics.write_topic(agent["id"], f"t{i:02d}.md", "y" * 60_000)
+    body = (await api.get(f"/api/v1/agents/{agent['id']}/export", params={"include_notes": "true"})).json()
+    assert len(body["document"]["notes"]["topics"]) == 10 and body["skipped"] == ["t10.md"]
+    assert (await api.post("/api/v1/agents/import", json={"document": body["document"]})).status_code == 201
+
+
 def test_memory_routes_are_admin_only():
     for method, path in (
         ("GET", "/api/v1/agents/1/memory/topics"),
@@ -123,6 +205,11 @@ def test_memory_routes_are_admin_only():
         ("GET", "/api/v1/agents/1/memory/journal"),
         ("POST", "/api/v1/agents/1/memory/journal/x/undo"),
         ("GET", "/api/v1/agents/1/memory/proposals"),
+        ("GET", "/api/v1/agents/1/memory/upkeep"),
+        ("POST", "/api/v1/agents/1/memory/tidy"),
+        ("GET", "/api/v1/agents/1/memory/logs"),
+        ("GET", "/api/v1/agents/1/memory/logs/2026-10-01"),
+        ("DELETE", "/api/v1/agents/1/memory/logs/2026-10-01"),
         ("POST", "/api/v1/agents/1/memory/proposals/x/accept"),
     ):
         assert policy.required_scope(method, path) == "admin", path

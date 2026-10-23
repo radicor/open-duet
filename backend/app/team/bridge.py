@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from sqlalchemy import select, update
 from app.db.models import Approval, Turn, Agent
 from app.db.transactions import begin_write
-from app.team import fence, service
+from app.team import fence, notices, policy, service, setup
 
 
 def canonical(value):
@@ -49,10 +49,11 @@ class TeamBridge:
 
     @property
     def launch(self):
+        extra = ['--escalations'] if notices.escalations_on() else []
         if getattr(sys, 'frozen', False):
-            return SimpleNamespace(command=sys.executable, args=['--team-mcp', '--mailbox', str(self.folder)], env={})
+            return SimpleNamespace(command=sys.executable, args=['--team-mcp', '--mailbox', str(self.folder), *extra], env={})
         root = str(Path(__file__).resolve().parents[2])
-        return SimpleNamespace(command=sys.executable, args=['-m', 'app.team.mcp_server', '--mailbox', str(self.folder)], env={'PYTHONPATH': root})
+        return SimpleNamespace(command=sys.executable, args=['-m', 'app.team.mcp_server', '--mailbox', str(self.folder), *extra], env={'PYTHONPATH': root})
 
     def start(self):
         self.task = asyncio.create_task(self.poll())
@@ -112,13 +113,23 @@ class TeamBridge:
                 return {'agents': [{'id': a.id, 'name': fence.line(a.name), 'title': fence.line(a.title), 'can_delegate': a.delegation_enabled} for a in rows]}
             if name == 'create_agent':
                 # A permission card cannot widen the immutable origin or plan floor.
-                if run.ctx.approval_mode == 'plan' or run.ctx.team.origin in ('outside', 'webhook'):
+                if run.ctx.approval_mode == 'plan' or run.ctx.team.origin in policy.UNATTENDED:
                     raise service.TeamError('forbidden', 'Creating an agent is unavailable for this turn.')
                 agent = await service.create_specialist(db, rt.owner_id, run.agent_id, run.turn_id, args)
                 await run.recorder.emit('team.agent.created', {'agent_id': agent.id, 'name': agent.name, 'title': agent.title, 'created_by_agent_id': run.agent_id, 'undo_until_used': True})
                 return {'agent_id': agent.id, 'name': agent.name, 'approval_mode': 'ask'}
+        if name in setup.TOOLS:
+            return await setup.call(rt, run, name, args)
         if name == 'ask_agent':
             return await rt.team_jobs.ask(run, args)
+        if name == 'delegate':
+            return await rt.team_jobs.delegate(run, args)
+        if name == 'job_status':
+            return await rt.team_jobs.job_status(run, args)
+        if name == 'retry_thread':
+            return await rt.notices.retry_thread(run, args)
+        if name == 'raise_escalation':
+            return await rt.notices.raise_escalation(run, args)
         if name in ('list_rooms', 'create_room', 'say_in_room'):
             return await rt.rooms.tool(run, name, args)
         raise service.TeamError('unknown_tool', 'Unknown team tool.')

@@ -29,12 +29,38 @@ CREATE TABLE agent_job (
 	started_at TIMESTAMP WITH TIME ZONE, 
 	finished_at TIMESTAMP WITH TIME ZONE, 
 	last_activity_at TIMESTAMP WITH TIME ZONE, 
+	kind VARCHAR DEFAULT 'job' NOT NULL, 
+	reply VARCHAR DEFAULT 'wait' NOT NULL, 
+	question TEXT, 
+	answer TEXT, 
+	restart VARCHAR, 
+	restarts INTEGER DEFAULT '0' NOT NULL, 
+	current_turn_id BIGINT, 
+	rework BOOLEAN DEFAULT false NOT NULL, 
+	budget_wakes INTEGER DEFAULT '48' NOT NULL, 
 	PRIMARY KEY (id)
 );
+
+CREATE INDEX ix_agent_job_parent ON agent_job (parent_id);
 
 CREATE INDEX ix_agent_job_requester_turn ON agent_job (requester_turn_id);
 
 CREATE INDEX ix_agent_job_status ON agent_job (owner_id, status);
+
+CREATE TABLE agent_job_inbox (
+	id BIGINT GENERATED ALWAYS AS IDENTITY, 
+	owner_id VARCHAR NOT NULL, 
+	holder_id BIGINT NOT NULL, 
+	job_id BIGINT NOT NULL, 
+	kind VARCHAR NOT NULL, 
+	created_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, 
+	delivered_at TIMESTAMP WITH TIME ZONE, 
+	PRIMARY KEY (id)
+);
+
+CREATE INDEX ix_agent_job_inbox_holder ON agent_job_inbox (holder_id, delivered_at);
+
+CREATE INDEX ix_agent_job_inbox_job ON agent_job_inbox (job_id);
 
 CREATE TABLE team (
 	id BIGINT GENERATED ALWAYS AS IDENTITY, 
@@ -60,6 +86,26 @@ CREATE TABLE team_event (
 	created_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, 
 	PRIMARY KEY (id)
 );
+
+CREATE TABLE team_setup_request (
+	id BIGINT GENERATED ALWAYS AS IDENTITY, 
+	owner_id VARCHAR NOT NULL, 
+	team_id BIGINT NOT NULL, 
+	lead_agent_id BIGINT NOT NULL, 
+	thread_id BIGINT, 
+	turn_id BIGINT, 
+	request_id VARCHAR NOT NULL, 
+	kind VARCHAR DEFAULT 'setup' NOT NULL, 
+	plan JSON NOT NULL, 
+	state VARCHAR DEFAULT 'applied' NOT NULL, 
+	result JSON NOT NULL, 
+	undo JSON NOT NULL, 
+	created_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL, 
+	decided_at TIMESTAMP WITH TIME ZONE, 
+	PRIMARY KEY (id)
+);
+
+CREATE UNIQUE INDEX uq_team_setup_request_owner_request ON team_setup_request (owner_id, request_id);
 
 CREATE TABLE agent_job_event (
 	id BIGINT GENERATED ALWAYS AS IDENTITY, 

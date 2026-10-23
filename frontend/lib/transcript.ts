@@ -6,6 +6,7 @@
 // preview that the stored assistant.message replaces.
 import type { ThreadEvent } from "./api";
 import type { RecalledNote, RecalledPassage } from "./memory";
+import type { NeedsYouRow } from "./needs-you";
 
 export type ApprovalStatus = "pending" | "allowed" | "denied" | "expired" | "cancelled";
 
@@ -16,10 +17,15 @@ export type AttachmentRef = { id: string; name: string; mime: string; bytes: num
 
 export type TeamJobItem = { kind: "team_job"; key: string; turnId: number | null; jobId: number; agentId: number; threadId: number | null; mode: string; brief: string; status: string; result: string; outcome: string };
 
+export type NeedsYouItem = { kind: "needs_you"; key: string; turnId: number | null; cardId: string; revision: number; title: string; subtitle: string; emptyText: string; more: number; rows: NeedsYouRow[] };
+
 export type TranscriptItem =
   | TeamJobItem
+  | NeedsYouItem
+  | { kind: "team_notice"; key: string; turnId: number | null; tone: "incident" | "escalation" | "refused" | "retried"; text: string; threadId: number | null }
+  | { kind: "team_setup"; key: string; turnId: number | null; requestId: string; undoAvailable: boolean; rows: { action: string; agentId: number; name: string }[] }
   | { kind: "agent_created"; key: string; turnId: number | null; agentId: number; name: string; title: string }
-  | { kind: "user"; key: string; turnId: number | null; text: string; attachments: AttachmentRef[] }
+  | { kind: "user"; key: string; turnId: number | null; text: string; attachments: AttachmentRef[]; skills?: string[] }
   | {
       kind: "assistant";
       key: string;
@@ -77,7 +83,7 @@ export type TranscriptItem =
   // The turn moved to the agent's fallback engine because its own was limited.
   | { kind: "engine_switched"; key: string; turnId: number | null; from: string; to: string; model: string; message: string }
   // Earlier messages were folded into a summary for an engine that replays the transcript.
-  | { kind: "compacted"; key: string; turnId: number | null; folded: number; summary: string };
+  | { kind: "compacted"; key: string; turnId: number | null; folded: number; summary: string; writtenBy?: string };
 
 export type Transcript = {
   items: TranscriptItem[];
@@ -313,6 +319,16 @@ export function applyEvent(state: Transcript, event: ThreadEvent): Transcript {
         items: [...state.items, { kind: "session_reset", key, message: text(data.message) }],
       };
 
+    case "skill.used": {
+      // The skills the person picked for this turn's message, shown on that message.
+      const names = Array.isArray(data.names) ? data.names.filter((n): n is string => typeof n === "string") : [];
+      if (id === null || names.length === 0) return base;
+      return {
+        ...base,
+        items: state.items.map((item) => (item.kind === "user" && item.turnId === id ? { ...item, skills: names } : item)),
+      };
+    }
+
     case "memory.recalled": {
       const list = (value: unknown) => (Array.isArray(value) ? value.map(record) : []);
       const notes = list(data.notes).map((n) => ({ name: text(n.name), title: text(n.title) || null, snippet: text(n.snippet) }));
@@ -348,6 +364,25 @@ export function applyEvent(state: Transcript, event: ThreadEvent): Transcript {
       return { ...base, items: [...state.items, { kind: "agent_created", key, turnId: id, agentId: data.agent_id, name: text(data.name), title: text(data.title) }] };
     }
 
+    case "team.setup.applied": {
+      if (typeof data.request_id !== "string" || !Array.isArray(data.results)) return base;
+      const rows = data.results.flatMap((row: unknown) => {
+        const r = row as { action?: unknown; agent_id?: unknown; name?: unknown };
+        return typeof r?.action === "string" && typeof r.agent_id === "number" ? [{ action: r.action, agentId: r.agent_id, name: text(r.name) }] : [];
+      });
+      return { ...base, items: [...state.items, { kind: "team_setup", key, turnId: id, requestId: data.request_id, undoAvailable: data.undo_available === true, rows }] };
+    }
+
+    // A report the lead was given about a teammate's thread, or a retry it made.
+    case "team.notice.chip":
+    case "team.notice.refused":
+    case "team.notice.retried": {
+      const message = text(data.text);
+      if (!message) return base;
+      const tone = event.type === "team.notice.refused" ? "refused" : event.type === "team.notice.retried" ? "retried" : data.family === "escalation" ? "escalation" : "incident";
+      return { ...base, items: [...state.items, { kind: "team_notice", key, turnId: id, tone, text: message, threadId: typeof data.thread_id === "number" ? data.thread_id : null }] };
+    }
+
     case "team.job.started":
     case "team.job.updated":
     case "team.job.finished": {
@@ -363,6 +398,25 @@ export function applyEvent(state: Transcript, event: ThreadEvent): Transcript {
       return { ...base, items: previous ? state.items.map(entry => entry === previous ? item : entry) : [...state.items, item] };
     }
 
+    // The day's Needs you card. Events are append-only, so a newer revision of the
+    // same card replaces the older one where it stands.
+    case "card.needs_you": {
+      if (typeof data.card_id !== "string" || !Array.isArray(data.items)) return base;
+      const previous = state.items.find((entry): entry is NeedsYouItem => entry.kind === "needs_you" && entry.cardId === data.card_id);
+      const revision = typeof data.revision === "number" ? data.revision : 1;
+      if (previous && previous.revision >= revision) return base;
+      const rows = data.items.flatMap((row: unknown): NeedsYouRow[] => {
+        const r = row as Partial<NeedsYouRow>;
+        return typeof r?.key === "string" && typeof r.kind === "string" ? [{ kind: r.kind, key: r.key, title: text(r.title), detail: typeof r.detail === "string" ? r.detail : null, thread_id: typeof r.thread_id === "number" ? r.thread_id : null }] : [];
+      });
+      const item: NeedsYouItem = {
+        kind: "needs_you", key: previous?.key ?? key, turnId: null, cardId: data.card_id, revision,
+        title: text(data.title) || "Needs you", subtitle: text(data.subtitle), emptyText: text(data.empty_text) || "Nothing needs you right now.",
+        more: typeof data.more === "number" ? data.more : 0, rows,
+      };
+      return { ...base, items: previous ? state.items.map((entry) => (entry === previous ? item : entry)) : [...state.items, item] };
+    }
+
     case "context.compacted":
       return {
         ...base,
@@ -374,6 +428,9 @@ export function applyEvent(state: Transcript, event: ThreadEvent): Transcript {
             turnId: id,
             folded: typeof data.folded_messages === "number" ? data.folded_messages : 0,
             summary: text(data.summary),
+            ...(record(data.written_by).via === "helper"
+              ? { writtenBy: `${text(record(data.written_by).engine)}${text(record(data.written_by).model) ? ` (${text(record(data.written_by).model)})` : ""}` }
+              : {}),
           },
         ],
       };

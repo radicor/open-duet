@@ -29,8 +29,9 @@ from app.schemas.agent import (
     TopicListResponse,
     TopicWriteRequest,
 )
-from app.services import agent_memory, agent_package, memory_journal, memory_proposals, memory_topics
+from app.services import agent_memory, agent_package, agent_skills, memory_entries, memory_journal, memory_log, memory_proposals, memory_topics
 from app.services import agent_store as store
+from app.services.agent_removal import remove_agent
 from app.services.local_access_policy import require_local_access
 from app.services.thread_runtime import EngineModelInvalid, ThreadRuntime, UnknownProvider
 from app.services.thread_runtime import runtime as default_runtime
@@ -125,6 +126,38 @@ def _start_notes(agent_id: int, notes: str | None) -> None:
         agent_memory.remove_memory(agent_id)
 
 
+def _start_imported_skills(agent_id: int, items: list[dict]) -> None:
+    """An imported agent is new: it starts with exactly the file's skills, all
+    turned off until the person reviews and turns them on. Text only."""
+    agent_skills.remove_all(agent_id)
+    for item in items:
+        try:
+            agent_skills.write_skill(
+                agent_id, item["name"], item["description"], item["body"], enabled=False, source="imported"
+            )
+        except agent_skills.SkillError:
+            continue
+
+
+def _start_imported_notes(agent_id: int, parsed: dict | None) -> None:
+    """An imported agent is new, so no notes of its own can be overwritten: it
+    starts with exactly the file's notes and topic notes. Each file written is
+    a journal row by `import`, so it can be undone."""
+    _start_notes(agent_id, parsed["notes"] if parsed else None)
+    if not parsed:
+        return
+    if parsed["notes"] and parsed["notes"].strip():
+        memory_journal.record(
+            agent_id, agent_memory.MEMORY_FILE, actor="import", before=None, after=agent_memory.read_memory(agent_id).text
+        )
+    for name, text in parsed["topics"].items():
+        try:
+            doc, _, _ = memory_topics.write_topic(agent_id, name, text)
+        except (agent_memory.MemoryTooLarge, memory_topics.InvalidTopicName, memory_topics.TooManyTopics):
+            continue
+        memory_journal.record(agent_id, memory_journal.note_path(name), actor="import", before=None, after=doc.text)
+
+
 def _check_engine(rt: ThreadRuntime, provider: str, model: str | None) -> None:
     """The engine must be registered and accept the model."""
     try:
@@ -177,6 +210,9 @@ async def create_agent(payload: AgentCreateRequest, rt: ThreadRuntime = Depends(
                 pinned=payload.pinned,
                 memory_enabled=payload.memory_enabled,
                 recall_enabled=payload.recall_enabled,
+                memory_upkeep=payload.memory_upkeep,
+                compaction_summary=payload.compaction_summary,
+                use_helper=payload.use_helper,
                 fallback_provider=payload.fallback_provider,
                 fallback_model=payload.fallback_model,
             )
@@ -227,6 +263,9 @@ async def update_agent(
             "pinned",
             "memory_enabled",
             "recall_enabled",
+            "memory_upkeep",
+            "compaction_summary",
+            "use_helper",
             "fallback_provider",
             "fallback_model",
         )
@@ -292,18 +331,9 @@ async def delete_agent(agent_id: int, rt: ThreadRuntime = Depends(get_runtime)):
     keep them linked."""
     await _agent_or_404(rt, agent_id)
     try:
-        async with rt.session() as db:
-            await store.delete_agent(db, agent_id)
+        await remove_agent(rt, agent_id)
     except store.AgentNotFound:
         raise HTTPException(status_code=404, detail="Agent not found") from None
-    # Its notes go with it; the folder stays, as its conversations may use it.
-    agent_memory.remove_memory(agent_id)
-    # So does its computer (the machine; never the folder). If Docker is not
-    # answering, the removal finishes later.
-    try:
-        await rt.computers.mark_agent_deleted(agent_id)
-    except Exception:  # noqa: BLE001
-        pass
 
 
 # --- notes (MEMORY.md) ---------------------------------------------------------------
@@ -323,6 +353,8 @@ def _memory_response(agent, doc: agent_memory.MemoryDoc, redacted: int = 0) -> A
         max_bytes=agent_memory.MAX_BYTES,
         enabled=agent.memory_enabled,
         redacted=redacted,
+        expired=doc.expired,
+        expired_lines=doc.expired_lines,
     )
 
 
@@ -460,6 +492,33 @@ async def delete_topic(
     memory_journal.record(agent.id, memory_journal.note_path(name), actor="person", before=before, after=None)
 
 
+# --- daily logs ------------------------------------------------------------------------
+
+
+@router.get("/{agent_id}/memory/logs")
+async def list_logs(agent_id: int, rt: ThreadRuntime = Depends(get_runtime)):
+    """The days that have a daily log (memory/log/YYYY-MM-DD.md), newest first."""
+    agent = await _agent_or_404(rt, agent_id)
+    return {"logs": memory_log.list_logs(agent.id)}
+
+
+@router.get("/{agent_id}/memory/logs/{day}")
+async def read_log(agent_id: int, day: str, rt: ThreadRuntime = Depends(get_runtime)):
+    """One day's log, read-only (redacted)."""
+    agent = await _agent_or_404(rt, agent_id)
+    text = memory_log.read_log(agent.id, day)
+    if text is None:
+        raise HTTPException(status_code=404, detail="No log for that day")
+    return {"day": day, "text": text}
+
+
+@router.delete("/{agent_id}/memory/logs/{day}", status_code=204)
+async def delete_log(agent_id: int, day: str, rt: ThreadRuntime = Depends(get_runtime)):
+    agent = await _agent_or_404(rt, agent_id)
+    if not memory_log.delete_log(agent.id, day):
+        raise HTTPException(status_code=404, detail="No log for that day")
+
+
 # --- the journal ---------------------------------------------------------------------
 
 
@@ -469,6 +528,7 @@ def _journal_row(row: dict) -> MemoryJournalRow:
         at=datetime.fromtimestamp(float(row.get("at") or 0), UTC),
         path=row["path"],
         actor=str(row.get("actor") or ""),
+        via=row.get("via") if isinstance(row.get("via"), str) else None,
         kind=str(row.get("kind") or ""),
         before_hash=row.get("before_hash"),
         after_hash=row.get("after_hash"),
@@ -519,6 +579,50 @@ def _proposal(p: dict) -> MemoryProposalResponse:
     )
 
 
+@router.get("/{agent_id}/memory/upkeep")
+async def memory_upkeep_status(agent_id: int, rt: ThreadRuntime = Depends(get_runtime)):
+    """Whether quiet memory upkeep is on for the agent, whether its engine can
+    make the background call, and what the last capture did."""
+    from app.core.config import settings
+    from app.services import memory_capture, memory_settings, side_jobs
+
+    agent = await _agent_or_404(rt, agent_id)
+    adapter = rt.adapters.get(agent.provider)
+    helper = side_jobs.configured()
+    helper_adapter = rt.adapters.get(helper.engine) if helper else None
+    helper_works = helper is not None and side_jobs.can_write(helper_adapter)
+    return {
+        # The helper model (docs/MEMORY.md): used only when this agent's own engine cannot write
+        # the job and the agent has not opted out. `helper_used` says it is in use for this agent now.
+        "helper": (
+            {"engine": helper.engine, "label": getattr(helper_adapter, "label", None) or helper.engine,
+             "model": helper.model, "source": helper.source, "usable": helper_works}
+            if helper else None
+        ),
+        "helper_used": bool(helper_works and not side_jobs.can_write(adapter) and agent.use_helper),
+        "enabled": bool(agent.memory_enabled and agent.memory_upkeep and settings.MEMORY_CAPTURE_QUIET_SECONDS > 0),
+        "engine_can_call": side_jobs.can_write(adapter),
+        "quiet_seconds": settings.MEMORY_CAPTURE_QUIET_SECONDS,
+        "last_capture": memory_capture.read_status(agent.id).get("last_capture"),
+        "last_tidy": memory_capture.read_status(agent.id).get("last_tidy"),
+        "tidy_hour": memory_settings.tidy_hour(),
+        "engine": agent.provider,
+        "helper_model": memory_capture.helper_model(agent.provider, None),
+    }
+
+
+@router.post("/{agent_id}/memory/tidy")
+async def tidy_now(agent_id: int, rt: ThreadRuntime = Depends(get_runtime)):
+    """Run the tidy-up now (organize, expire, de-duplicate, reconcile
+    contradictions). 409 while the agent is working or upkeep is off."""
+    agent = await _agent_or_404(rt, agent_id)
+    if not (agent.memory_enabled and agent.memory_upkeep):
+        raise _error(409, "upkeep_off", "Memory upkeep is off for this agent.")
+    if rt.capture.busy(agent.id):
+        raise _error(409, "agent_busy", "The agent is working; try again when it is done.")
+    return await rt.capture.tidy(agent.id)
+
+
 @router.get("/{agent_id}/memory/proposals", response_model=list[MemoryProposalResponse])
 async def list_proposals(agent_id: int, rt: ThreadRuntime = Depends(get_runtime)):
     """Notes proposed from conversations that have gone quiet, waiting for
@@ -550,6 +654,8 @@ async def accept_proposal(
         raise HTTPException(status_code=404, detail="No such proposal") from None
     except agent_memory.MemoryTooLarge as exc:
         raise _error(413, "memory_too_large", str(exc)) from None
+    except memory_entries.EntryTooLarge as exc:
+        raise _error(422, "entry_too_large", str(exc)) from None
     except memory_topics.TooManyTopics as exc:
         raise _error(409, "too_many_topics", str(exc)) from None
 
@@ -569,7 +675,10 @@ async def reject_proposal(agent_id: int, proposal_id: str, rt: ThreadRuntime = D
 
 @router.get("/{agent_id}/export", response_model=AgentExportResponse)
 async def export_agent(
-    agent_id: int, include_notes: bool = False, rt: ThreadRuntime = Depends(get_runtime)
+    agent_id: int,
+    include_notes: bool = False,
+    include_skills: bool = False,
+    rt: ThreadRuntime = Depends(get_runtime),
 ):
     """The agent as one file: name, title, description, instructions and, with
     `include_notes`, its notes. Never its model, folder, approval mode or
@@ -577,9 +686,20 @@ async def export_agent(
     `redacted` names the parts where that happened."""
     agent = await _agent_or_404(rt, agent_id)
     notes = agent_memory.read_memory(agent.id).text if include_notes else None
-    document, redacted = agent_package.export_package(agent, notes)
+    topics = (
+        {
+            t.name: memory_topics.read_topic(agent.id, t.name).text
+            for t in memory_topics.list_topics(agent.id)
+            if t.name != memory_topics.ARCHIVE_NAME
+        }
+        if include_notes
+        else None
+    )
+    skipped: list[str] = []
+    saved_skills = agent_skills.export_items(agent.id) if include_skills else None
+    document, redacted = agent_package.export_package(agent, notes, topics, skipped, saved_skills)
     return AgentExportResponse(
-        file_name=agent_package.file_name(agent.name), document=document, redacted=redacted
+        file_name=agent_package.file_name(agent.name), document=document, redacted=redacted, skipped=skipped
     )
 
 
@@ -606,6 +726,7 @@ async def import_agent(payload: AgentImportRequest, rt: ThreadRuntime = Depends(
             )
     except store.AgentNameTaken:
         raise _error(409, "agent_name_taken", "Try again: that name was just taken.") from None
-    _start_notes(agent.id, parsed["notes"] if payload.include_notes else None)
+    _start_imported_notes(agent.id, parsed if payload.include_notes else None)
+    _start_imported_skills(agent.id, parsed["skills"] if payload.include_skills else [])
     return agent
 

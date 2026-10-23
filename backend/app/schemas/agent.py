@@ -53,6 +53,13 @@ class AgentCreateRequest(BaseModel):
     # Before each turn, add relevant notes and earlier conversations to the
     # person's message (docs/MEMORY.md). Has no effect while memory is off.
     recall_enabled: bool = True
+    # Quiet background memory upkeep: a model call that files facts noticed in
+    # conversations (docs/MEMORY.md). Has no effect while memory is off.
+    memory_upkeep: bool = True
+    # A model writes the summary when a long conversation is folded (docs/MEMORY.md).
+    compaction_summary: bool = True
+    # The helper model may write this agent's background texts when its own engine cannot.
+    use_helper: bool = True
     # Optional: another engine (and its model; null for its default) a turn
     # moves to when this agent's engine refuses it for a usage or rate limit
     # before starting on it (docs/ENGINES.md). It must differ from `provider`.
@@ -94,6 +101,9 @@ class AgentUpdateRequest(BaseModel):
     pinned: bool | None = None
     memory_enabled: bool | None = None
     recall_enabled: bool | None = None
+    memory_upkeep: bool | None = None
+    compaction_summary: bool | None = None
+    use_helper: bool | None = None
     # An explicit null removes the fallback engine (and its model).
     fallback_provider: str | None = Field(default=None, min_length=1, max_length=64)
     fallback_model: str | None = Field(default=None, max_length=200)
@@ -118,7 +128,7 @@ class AgentUpdateRequest(BaseModel):
     def _something_to_change(self):
         if not self.model_fields_set:
             raise ValueError("send at least one field to change")
-        for field in ("name", "instructions", "provider", "approval_mode", "pinned", "memory_enabled", "recall_enabled", "archived"):
+        for field in ("name", "instructions", "provider", "approval_mode", "pinned", "memory_enabled", "recall_enabled", "memory_upkeep", "compaction_summary", "use_helper", "archived"):
             if field in self.model_fields_set and getattr(self, field) is None:
                 raise ValueError(f"{field} cannot be null")
         return self
@@ -141,6 +151,9 @@ class AgentResponse(BaseModel):
     pinned: bool
     memory_enabled: bool
     recall_enabled: bool = True
+    memory_upkeep: bool = True
+    compaction_summary: bool = True
+    use_helper: bool = True
     fallback_provider: str | None = None
     fallback_model: str | None = None
     archived_at: datetime | None
@@ -174,6 +187,9 @@ class AgentMemoryResponse(BaseModel):
     max_lines: int
     max_bytes: int
     enabled: bool
+    # Entries whose `until` day has passed (not loaded, still in the file).
+    expired: int = 0
+    expired_lines: int = 0
     # Set on a save: how many things that looked like secrets were replaced.
     redacted: int = 0
 
@@ -189,12 +205,16 @@ class AgentExportResponse(BaseModel):
     document: dict
     # Parts in which something that looked like a secret was replaced.
     redacted: list[str]
+    # Topic notes left out because the file would be too large (their names).
+    skipped: list[str] = []
 
 
 class AgentImportRequest(BaseModel):
     document: dict
     # False leaves the file's notes out even when it carries some.
     include_notes: bool = True
+    # False leaves the file's skills out. Imported skills always start off.
+    include_skills: bool = True
 
 
 # --- topic notes, the journal and proposed notes (docs/MEMORY.md) ------------------------
@@ -237,6 +257,8 @@ class MemoryJournalRow(BaseModel):
     path: str
     # person | proposal | undo
     actor: str
+    # For upkeep rows, the step: capture | tidy | organize
+    via: str | None = None
     # created | edited | deleted
     kind: str
     before_hash: str | None

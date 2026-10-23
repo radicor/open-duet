@@ -92,7 +92,10 @@ async def list_threads(
     db: AsyncSession, owner_id: str, *, include_archived: bool = False, limit: int = 100, kind: str = "chat"
 ) -> list[Thread]:
     query = select(Thread).where(Thread.owner_id == owner_id)
-    if kind != "all":
+    if kind == "chat":
+        # The lead's report threads ("Team incidents") sit with the person's chats.
+        query = query.where(Thread.kind.in_(("chat", "team_notices")))
+    elif kind != "all":
         query = query.where(Thread.kind == kind)
     if not include_archived:
         query = query.where(Thread.archived_at.is_(None))
@@ -541,6 +544,7 @@ async def start_turn(
     *,
     owner_instance: str | None = None,
     attachments: list[dict] | None = None,
+    origin: str | None = None,
 ) -> Turn:
     """Start the thread's next turn and store its `turn.started` event.
 
@@ -569,6 +573,7 @@ async def start_turn(
         owner_token=secrets.token_urlsafe(24),
         owner_instance=owner_instance,
         engine_phase="preparing",
+        origin=origin,
         heartbeat_at=now,
         started_at=now,
     )
@@ -675,7 +680,7 @@ async def finish_turn(
 
 
 # Events a turn stores that are not the engine's own work.
-NOT_ENGINE_EVENTS = ("turn.started", "memory.recalled", "context.compacted", "engine.switched", "approval.resolved")
+NOT_ENGINE_EVENTS = ("turn.started", "memory.recalled", "skill.used", "context.compacted", "engine.switched", "approval.resolved")
 
 # How far a turn cut by a crash or a stop had got (docs/RELIABILITY.md):
 # before_accept  the prompt never reached the engine: nothing ran, safe to send again;

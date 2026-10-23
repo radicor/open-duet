@@ -6,7 +6,7 @@ from app.db.models import Agent, Team, TeamEvent, AgentJob, AgentJobEvent, Appro
 from app.db.transactions import begin_write
 from app.services.local_access_policy import require_local_access
 from app.routers.threads import get_runtime
-from app.team import service, jobs
+from app.team import service, jobs, setup
 from app.services.engine_registry import capabilities_of
 from app.core.config import settings
 
@@ -51,16 +51,24 @@ async def get_team(rt=Depends(get_runtime)):
             data.update(is_lead=team.lead_agent_id == agent.id, state='waiting_on_you' if waiting else 'working' if running else 'idle', instructions_reviewed=agent.created_by_agent_id is None or agent.instructions_reviewed_at is not None)
             output.append(data)
         lead = next((a for a in rows if a.id == team.lead_agent_id), None)
-        available = bool(lead and lead.provider in rt.adapters and capabilities_of(rt.adapters[lead.provider]).mcp)
+        available = bool(lead and lead_engine_ok(rt, lead))
         return {'team': {'id': team.id, 'name': team.name, 'lead_agent_id': team.lead_agent_id}, 'agents': output,
                 'limits': {'max_agents': settings.TEAM_MAX_AGENTS, 'max_depth': settings.TEAM_MAX_DEPTH, 'max_parallel': settings.TEAM_MAX_PARALLEL},
                 'lead_ready': {'ok': available, 'reason': None if available else 'This lead needs an engine with team tools (Claude).'}}
+
+
+def lead_engine_ok(rt, agent):
+    adapter = rt.adapters.get(agent.provider) if agent else None
+    return bool(adapter and capabilities_of(adapter).mcp)
 
 
 @router.post('/lead')
 async def lead(payload: LeadRequest, rt=Depends(get_runtime)):
     try:
         async with rt.session() as db:
+            candidate = await db.get(Agent, payload.agent_id)
+            if candidate is not None and not lead_engine_ok(rt, candidate):
+                raise service.TeamError('lead_engine', 'A lead needs an engine with team tools (Claude).')
             await service.set_lead(db, rt.owner_id, payload.agent_id, payload.name)
     except service.TeamError as exc:
         raise error(exc) from None
@@ -118,6 +126,31 @@ async def undo_create(agent_id: int, rt=Depends(get_runtime)):
         raise error(exc) from None
 
 
+@router.get('/agents/{agent_id}/undo-state')
+async def undo_state(agent_id: int, rt=Depends(get_runtime)):
+    async with rt.session() as db:
+        return {'available': await service.undo_available(db, rt.owner_id, agent_id)}
+
+
+@router.get('/setup')
+async def list_setup(limit: int = Query(20, ge=1, le=100), rt=Depends(get_runtime)):
+    """Recent team changes the lead made, newest first, with whether Undo still applies."""
+    from app.db.models import TeamSetupRequest
+    async with rt.session() as db:
+        rows = list((await db.execute(select(TeamSetupRequest).where(TeamSetupRequest.owner_id == rt.owner_id).order_by(TeamSetupRequest.id.desc()).limit(limit))).scalars())
+        return [{'request_id': r.request_id, 'kind': r.kind, 'state': r.state, 'results': r.result.get('results', []), 'thread_id': r.thread_id,
+                 'undo_available': r.kind == 'setup' and r.state == 'applied', 'created_at': r.created_at} for r in rows]
+
+
+@router.post('/setup/{request_id}/undo')
+async def undo_setup(request_id: str, rt=Depends(get_runtime)):
+    try:
+        async with rt.session() as db:
+            return await setup.undo(db, rt.owner_id, request_id)
+    except service.TeamError as exc:
+        raise error(exc) from None
+
+
 async def owned_job(rt, db, job_id):
     job = await db.get(AgentJob, job_id)
     if job is None or job.owner_id != rt.owner_id:
@@ -129,7 +162,7 @@ async def owned_job(rt, db, job_id):
 async def list_jobs(root_id: int | None = None, thread_id: int | None = None, status: str | None = None,
                     limit: int = Query(100, ge=1, le=500), rt=Depends(get_runtime)):
     async with rt.session() as db:
-        query = select(AgentJob).where(AgentJob.owner_id == rt.owner_id)
+        query = select(AgentJob).where(AgentJob.owner_id == rt.owner_id, AgentJob.kind != 'root')
         if root_id is not None:
             query = query.where((AgentJob.root_id == root_id) | (AgentJob.id == root_id))
         if thread_id is not None:

@@ -2,9 +2,16 @@
 
 An agent can have its own computer: an isolated machine where its turns run
 their commands and file edits instead of on the machine running Open Duet.
-Today a computer is a Docker container on this machine. The design leaves room
-for two more kinds: a server you own reached over SSH, and a desktop computer
-with a screen.
+Docker computers can be a shell or an isolated Linux desktop with screen
+tools, live viewing and takeover. The macOS desktop app also offers a separate,
+explicitly enabled [native desktop preview](NATIVE-DESKTOP.md) that acts on this
+Mac's apps. Docker stays the isolated default. Remote SSH computers remain
+unimplemented.
+
+Desktop computers also expose structured `browser_*` tools for their own
+Chromium browser. See [the image setup](../desktop-image/README.md) and
+[browser tools](BROWSER.md). Rebuild the local image and recreate older desktop
+computers to install Chromium and the CDP broker.
 
 Status: experimental. Tested with a fake `docker` executable and the real
 Claude CLI. Provider tests against a real Docker daemon are included and run
@@ -255,9 +262,7 @@ without computers the button explains that and nothing else changes.
   config (host key accepted by hand first, connection sharing and short
   timeouts, no ports published on the server). The bind mount would then be a
   folder on the server, not the local workspace.
-- **A desktop computer** (a screen to watch and take over), with screenshot
-  and input tools behind the same approval gate.
-- **Several turns at once** on one computer share it today; there is no queue
-  for the screen because there is no screen yet.
+- A screen queue across conversations. Desktop and browser input currently
+  refuse another conversation while its screen ownership lease is active.
 - Other providers than Claude: the computer reaches a turn through an MCP
   server, which another provider adapter could mount the same way.

@@ -48,6 +48,11 @@ export function UserMessage({ item, threadId = null }: { item: Item<"user">; thr
       <p className="max-w-[88%] whitespace-pre-wrap break-words rounded-2xl rounded-br-md bg-bubble px-4 py-2.5 text-[15px] leading-relaxed text-ink sm:max-w-[80%]">
         {item.text}
       </p>
+      {item.skills && item.skills.length > 0 && (
+        <p className="max-w-[88%] break-words text-xs text-muted sm:max-w-[80%]">
+          Skill: <span className="font-mono">{item.skills.map((name) => `/${name}`).join(" ")}</span>
+        </p>
+      )}
     </div>
   );
 }
@@ -182,7 +187,7 @@ export function ApprovalCard({
         {pending ? (
           isComputerTool(item.tool) ? (
             <>
-              {screenInput ? "Let your agent use this computer’s screen and keyboard for this turn." : <>Your agent wants to {toolLabel(item.tool)}, an isolated machine, not this one.</>} It will not run
+              {screenInput ? "Let your agent use this computer’s screen, keyboard and browser for this turn." : <>Your agent wants to {toolLabel(item.tool)}, an isolated machine, not this one.</>} It will not run
               until you allow it.
             </>
           ) : (
@@ -361,7 +366,7 @@ export function CompactedMarker({ item }: { item: Item<"compacted"> }) {
   const [open, setOpen] = useState(false);
   return (
     <div className="border-y border-dashed border-line py-2 text-center text-xs text-muted">
-      <p>{compactedLabel(item.folded)}</p>
+      <p>{compactedLabel(item.folded, item.writtenBy)}</p>
       {item.summary && (
         <button onClick={() => setOpen((v) => !v)} aria-expanded={open} className="mt-1 cursor-pointer underline">
           {open ? "Hide the summary" : "Show the summary"}

@@ -8,16 +8,20 @@ team lead, its authority -- to a brand-new agent. AUTOINCREMENT never reuses an
 id. PostgreSQL identity columns never did, so this does nothing there.
 
 SQLite cannot add AUTOINCREMENT to an existing table, so `agent` is rebuilt:
-copied aside, dropped, created again, refilled with the same ids, and its index
-recreated. Existing databases already hold bare integer references to agents
-(team.lead_agent_id, thread.agent_id, agent_job.*, room*, ...), and a delete
-before this upgrade left some of them dangling; the next id must start above
-every id any surviving row still names, so those references never land on a new
-agent. Everything runs in this migration's one transaction, so a failure leaves
-the database as it was. The desktop app copies the database file aside first.
+copied aside, dropped, created again, refilled with the same ids, and its
+indexes and triggers are recreated. Existing databases already hold bare
+integer references to agents (team.lead_agent_id, thread.agent_id,
+agent_job.*, room*, ...), and a delete before this upgrade left some of them
+dangling; the next id must start above every id any surviving row still names,
+so those references never land on a new agent. Everything runs in this
+migration's one transaction, so a failure leaves the database as it was. The
+desktop app copies the database file aside first.
 
-The DDL is spelled out (not generated from the models) so this migration never
-changes.
+The rebuild reads the columns, defaults, indexes and triggers the live database
+holds for `agent` at execution time instead of spelling the schema out here:
+other migrations add columns to `agent` (memory upkeep and friends came in on a
+merged branch), and whichever order a fresh database walks the merged
+branches in, a rebuild from the live schema cannot drop them.
 
 Revision ID: c4a1f9e2d073
 Revises: b9d3e7a1c502
@@ -29,14 +33,6 @@ revision = "c4a1f9e2d073"
 down_revision = "b9d3e7a1c502"
 branch_labels = None
 depends_on = None
-
-_COLUMNS = (
-    "id", "owner_id", "name", "title", "description", "instructions", "provider",
-    "model", "fallback_provider", "fallback_model", "workspace_path", "approval_mode",
-    "memory_enabled", "recall_enabled", "pinned", "team_id", "delegation_enabled",
-    "created_by_agent_id", "instructions_reviewed_at", "archived_at", "created_at",
-    "updated_at",
-)
 
 # Every column, anywhere, that names an agent by id but is not a foreign key.
 _REFERENCES = (
@@ -53,42 +49,46 @@ _REFERENCES = (
     ("agent", "created_by_agent_id"),
 )
 
-def _agent_sql(autoincrement: bool) -> str:
-    id_column = (
-        "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,"
-        if autoincrement
-        else "id INTEGER NOT NULL,"
-    )
-    primary_key = "" if autoincrement else ",\n\tPRIMARY KEY (id)"
-    return f"""CREATE TABLE agent (
-	{id_column}
-	owner_id VARCHAR NOT NULL,
-	name VARCHAR NOT NULL,
-	title VARCHAR,
-	description TEXT,
-	instructions TEXT DEFAULT '' NOT NULL,
-	provider VARCHAR DEFAULT 'claude' NOT NULL,
-	model VARCHAR,
-	fallback_provider VARCHAR,
-	fallback_model VARCHAR,
-	workspace_path VARCHAR,
-	approval_mode VARCHAR DEFAULT 'ask' NOT NULL,
-	memory_enabled BOOLEAN DEFAULT 1 NOT NULL,
-	recall_enabled BOOLEAN DEFAULT 1 NOT NULL,
-	pinned BOOLEAN DEFAULT 0 NOT NULL,
-	team_id BIGINT,
-	delegation_enabled BOOLEAN DEFAULT 1 NOT NULL,
-	created_by_agent_id BIGINT,
-	instructions_reviewed_at DATETIME,
-	archived_at DATETIME,
-	created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL,
-	updated_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL{primary_key}
-)"""
 
-_INDEX_SQL = (
-    "CREATE UNIQUE INDEX uq_agent_owner_name_live ON agent (owner_id, name) "
-    "WHERE archived_at IS NULL",
-)
+def _agent_columns(bind) -> list:
+    """The `agent` table's columns as the database holds them now."""
+    columns = list(bind.exec_driver_sql('PRAGMA table_info("agent")'))
+    if not columns:
+        raise RuntimeError("the agent table does not exist")
+    return columns
+
+
+def _agent_objects(bind) -> list[str]:
+    """The index and trigger DDL the live database holds for `agent`."""
+    return [
+        row[0]
+        for row in bind.exec_driver_sql(
+            "SELECT sql FROM sqlite_master "
+            "WHERE tbl_name = 'agent' AND type IN ('index', 'trigger') "
+            "AND sql IS NOT NULL"
+        )
+    ]
+
+
+def _agent_ddl(columns, autoincrement: bool) -> str:
+    """CREATE TABLE agent from the live column list, with (or without) AUTOINCREMENT."""
+    pk_names = [row[1] for row in columns if row[5]]
+    definitions = []
+    for _cid, name, sqltype, notnull, dflt, _pk in columns:
+        if autoincrement and name == "id":
+            definitions.append("id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT")
+            continue
+        text = f'"{name}" {sqltype}'
+        if notnull:
+            text += " NOT NULL"
+        if dflt is not None:
+            text += f" DEFAULT {dflt}"
+        definitions.append(text)
+    body = ",\n        ".join(definitions)
+    if not autoincrement and pk_names:
+        keys = ", ".join(f'"{name}"' for name in pk_names)
+        body += f",\n\tPRIMARY KEY ({keys})"
+    return f"CREATE TABLE agent (\n        {body}\n)"
 
 
 def _highest_referenced_id(bind) -> int:
@@ -114,16 +114,18 @@ def _highest_referenced_id(bind) -> int:
 
 def _rebuild(autoincrement: bool) -> None:
     bind = op.get_bind()
-    columns = ", ".join(_COLUMNS)
+    columns = _agent_columns(bind)
+    object_ddl = _agent_objects(bind)
+    names = ", ".join(f'"{row[1]}"' for row in columns)
     bind.exec_driver_sql("DROP TABLE IF EXISTS _rebuild_agent")
-    bind.exec_driver_sql(f"CREATE TABLE _rebuild_agent AS SELECT {columns} FROM agent")
+    bind.exec_driver_sql(f"CREATE TABLE _rebuild_agent AS SELECT {names} FROM agent")
     bind.exec_driver_sql("DROP TABLE agent")
-    bind.exec_driver_sql(_agent_sql(autoincrement))
+    bind.exec_driver_sql(_agent_ddl(columns, autoincrement))
     bind.exec_driver_sql(
-        f"INSERT INTO agent ({columns}) SELECT {columns} FROM _rebuild_agent ORDER BY rowid"
+        f"INSERT INTO agent ({names}) SELECT {names} FROM _rebuild_agent ORDER BY rowid"
     )
     bind.exec_driver_sql("DROP TABLE _rebuild_agent")
-    for statement in _INDEX_SQL:
+    for statement in object_ddl:
         bind.exec_driver_sql(statement)
 
     if autoincrement:

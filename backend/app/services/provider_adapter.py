@@ -34,6 +34,12 @@ class Decision:
     message: str | None = None
 
 
+class ReplayAborted(Exception):
+    """The run was stopped (or no longer owns its turn) while the stored
+    conversation was being prepared for replay. The adapter ends the turn
+    without sending anything."""
+
+
 @dataclass(frozen=True)
 class Capabilities:
     """What an engine can do through this app. The runtime and the API read
@@ -42,6 +48,11 @@ class Capabilities:
     tools      the engine can run tools (commands, file edits) in the workspace
     approvals  its tool calls can be put to a person through the approval gate
     mcp        it can mount an MCP server this app gives it
+    memory_tools  it mounts the read-only past-conversation search (session_search,
+               session_read; memory_bridge.py) and lets those two calls through
+               without a card. Claude has this through `mcp`; Codex and ACP agents
+               mount only this one server, not the team tools, so they set this
+               and leave `mcp` off
     images     it accepts images attached to a message (TurnContext.images);
                an image sent to any other engine is refused before the turn
     resume     a conversation continues with the engine's earlier context
@@ -54,6 +65,11 @@ class Capabilities:
     images: bool = False
     resume: bool = False
     computers: bool = False
+    memory_tools: bool = False
+
+    @property
+    def can_search_history(self) -> bool:
+        return self.mcp or self.memory_tools
 
     def as_dict(self) -> dict:
         return {
@@ -158,6 +174,9 @@ class TurnContext:
     engine_config: dict | None = None
     team: object | None = None
     team_launch: object | None = None
+    # The MCP server giving the turn the agent's past-conversation search
+    # (memory_bridge.py), when the engine can mount one.
+    memory_launch: object | None = None
     hold_clock: Callable[[], Callable[[], None]] | None = None
     # Images attached to this message, as {"path", "mime", "name"}. Only ever
     # set for an engine whose capabilities include `images`; attached text

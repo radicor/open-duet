@@ -74,9 +74,12 @@ def _diff(before: str, after: str, path: str) -> tuple[str, int, int]:
     return text, added, removed
 
 
-def record(agent_id: int, path: str, *, actor: str, before: str | None, after: str | None) -> dict | None:
+def record(
+    agent_id: int, path: str, *, actor: str, before: str | None, after: str | None, via: str | None = None
+) -> dict | None:
     """Append one row; None when nothing changed or the row could not be
-    written (logged, never raised)."""
+    written (logged, never raised). `via` names the upkeep step that wrote it
+    ("capture", "tidy" or "organize")."""
     if before == after:
         return None
     kind = "created" if before is None else "deleted" if after is None else "edited"
@@ -96,6 +99,7 @@ def record(agent_id: int, path: str, *, actor: str, before: str | None, after: s
         "at": time.time(),
         "path": path,
         "actor": actor,
+        "via": via,
         "kind": kind,
         "before_hash": None if before is None else text_hash(before),
         "after_hash": None if after is None else text_hash(after),
@@ -146,6 +150,34 @@ def remove(agent_id: int) -> None:
         journal_path(agent_id).unlink()
     except OSError:
         pass
+
+
+def snapshot(agent_id: int) -> dict[str, str | None]:
+    """What every memory file says right now (MEMORY.md and each topic note),
+    for `record_changes` at the end of a turn."""
+    out: dict[str, str | None] = {agent_memory.MEMORY_FILE: agent_memory.read_memory(agent_id).text}
+    for topic in memory_topics.list_topics(agent_id):
+        out[note_path(topic.name)] = memory_topics.read_topic(agent_id, topic.name).text
+    return out
+
+
+def record_changes(agent_id: int, before: dict[str, str | None], *, actor: str = "agent") -> int:
+    """Journal what differs from `before`: the changes an agent made with its
+    own file tools during a turn. A file whose newest row already ends in its
+    current text (the app wrote it and journaled it) is skipped. Returns the
+    number of rows written."""
+    after = snapshot(agent_id)
+    rows = 0
+    for path in sorted(set(before) | set(after)):
+        old, new = before.get(path), after.get(path)
+        if old == new:
+            continue
+        last = next((r for r in read(agent_id, 20) if r.get("path") == path), None)
+        if last is not None and last.get("after_hash") == (None if new is None else text_hash(new)):
+            continue
+        if record(agent_id, path, actor=actor, before=old, after=new) is not None:
+            rows += 1
+    return rows
 
 
 def _current(agent_id: int, path: str) -> str | None:

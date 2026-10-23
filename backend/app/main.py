@@ -91,6 +91,11 @@ async def _serving(app: FastAPI):
         # Boat sandboxes: honour the TTL recorded at creation (deactivate the
         # row and ask the provider to delete the box). Does nothing without Boat.
         asyncio.create_task(run_every(BACKGROUND_INTERVAL_SECONDS, user_sandbox_service.run_expiry)),
+        # The nightly memory tidy-up for agents that are due and idle (memory_capture.py).
+        asyncio.create_task(run_every(600, thread_runtime.capture.tick)),
+        # The Needs you card: refreshed once a minute, started only for something
+        # that needs the person (app/team/needs_you.py).
+        asyncio.create_task(run_every(60, _needs_you_tick)),
         # Local routines: due occurrences, starts, approvals, run limits, endings.
         asyncio.create_task(run_every(settings.ROUTINE_POLL_SECONDS, routines.tick)),
     ]
@@ -110,6 +115,13 @@ async def _serving(app: FastAPI):
     if guard.held:
         await routine_service.scheduler.shutdown()
     await guard.release()
+
+
+async def _needs_you_tick() -> None:
+    from app.routers.needs_you import service_for
+    from app.services.thread_runtime import runtime
+
+    await service_for(runtime).tick()
 
 
 class _GuardedRoutines:
@@ -144,6 +156,8 @@ class _GuardedRoutines:
             await routine_service.scheduler.tick()
             from app.services.thread_runtime import runtime
             await runtime.rooms.tick()
+            await runtime.team_jobs.tick()
+            await runtime.notices.tick()
 
 
 app = FastAPI(lifespan=lifespan)

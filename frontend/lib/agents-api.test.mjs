@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
 import { api, ApiError } from './api.ts';
-import { activeAgents, agentFileHasNotes, agentFileText, agentNames, memoryGauge, modelFromInput, modelLabel, approvalModeLabel, parseAgentFile, redactionNotice } from './agents.ts';
+import { activeAgents, agentFileHasNotes, agentFileText, agentNames, memoryGauge, tidyLine, modelFromInput, modelLabel, approvalModeLabel, parseAgentFile, redactionNotice } from './agents.ts';
 
 const originalFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = originalFetch; });
@@ -112,6 +112,10 @@ test('the notes gauge goes amber from 80% and red once anything is cut', () => {
   assert.equal(over.percent, 100);
   assert.match(over.text, /250 of 200 lines/);
   assert.match(over.text, /50 lines past the limit/);
+  // Expired notes are not loaded and are not counted as cut off.
+  const expired = memoryGauge({ ...base, lines: 12, bytes: 400, loaded_lines: 9, expired: 3, expired_lines: 3 });
+  assert.equal(expired.level, 'ok');
+  assert.match(expired.text, /3 expired notes are not loaded/);
 });
 
 test('agent files are read with a sentence when they are not one', () => {
@@ -126,4 +130,12 @@ test('agent files are read with a sentence when they are not one', () => {
 test('the export notice names the redacted parts', () => {
   assert.equal(redactionNotice([]), null);
   assert.match(redactionNotice(['instructions', 'notes']), /instructions, notes/);
+});
+
+test('a tidy-up is described in one line', () => {
+  assert.equal(tidyLine({ organized: 0, expired: 0, duplicates: 0, superseded: 0, note: null }), 'Nothing to tidy.');
+  assert.equal(
+    tidyLine({ organized: 2, expired: 1, duplicates: 3, superseded: 1, note: null }),
+    'Tidied: 2 filed into topic notes, 1 expired moved to the archive, 3 repeats removed, 1 contradicted note struck through.'
+  );
 });

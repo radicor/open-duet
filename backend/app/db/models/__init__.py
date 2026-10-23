@@ -5,7 +5,8 @@ from app.db.models.link_code import LinkCode
 from app.db.models.schedule import Schedule
 from app.db.models.permission_rule import PermissionRule
 from app.db.models.permission_ask import PermissionAsk
-from app.db.models.team import Team, TeamEvent, AgentJob, AgentJobEvent, Room, RoomMember, RoomDispatch
+from app.db.models.delegation import AgentJobInbox
+from app.db.models.team import Team, TeamEvent, AgentJob, AgentJobEvent, Room, RoomMember, RoomDispatch, TeamSetupRequest, TeamNotice
 from app.db.models.agent import Agent
 from app.db.models.thread import Thread
 from app.db.models.turn import Turn
@@ -15,6 +16,7 @@ from app.db.models.app_setting import AppSetting, SettingAudit
 from app.db.models.computer import Computer
 from app.db.models.routine import Routine, RoutineRun
 from app.db.models.notification import Notification
+from app.db.models.needs_you import NeedsYouState
 from app.db.models.auth import AuthSession, OwnerAccount, PairingCode
 
 __all__ = [
@@ -38,5 +40,7 @@ __all__ = [
     "PairingCode",
     "Routine",
     "RoutineRun",
+    "NeedsYouState",
+    "TeamNotice",
     "Notification",
 ]

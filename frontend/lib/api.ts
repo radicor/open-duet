@@ -270,7 +270,6 @@ export type LinkCode = {
 
 export type LinkStatus = {
   status: "pending" | "claimed" | "expired";
-  user_id: string | null;
 };
 
 export type Sandbox = {

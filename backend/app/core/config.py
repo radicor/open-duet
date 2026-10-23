@@ -145,6 +145,13 @@ class Settings(BaseSettings):
     # only catches an engine whose own time limit did not end it. 0 turns it off.
     TURN_STALL_SECONDS: float = 600
 
+    # How many turns may run at once. Each holds one worker thread for its whole
+    # life (local_claude_runner waits on the process), and the same pool carries
+    # the background recovery jobs, so this must stay well under the pool size
+    # (AnyIO's default 40). Turns past the cap wait their turn instead of
+    # starving routine scheduling, task sync and computer upkeep.
+    TURN_MAX_CONCURRENT: int = 16
+
     # Routines (docs/ROUTINES.md): how often the scheduler looks for due and
     # finished runs, the largest webhook body accepted, and an optional
     # Telegram chat that also gets routine notifications (needs
@@ -254,6 +261,15 @@ class Settings(BaseSettings):
         return Path.home() / ".open-dots" / "open-dots.db"
 
     @property
+    def DATABASE_DISPLAY_URL(self) -> str:
+        """The selected database as a URL, password hidden: safe to show or log
+        (PostgreSQL driver errors often echo a DSN, so never log the connect
+        URLs below)."""
+        if self.DATABASE_KIND == "sqlite":
+            return self._sqlite_url("sqlite")
+        return self._database_url("postgresql", hide_password=True)
+
+    @property
     def ASYNC_DATABASE_URL(self) -> str:
         if self.DATABASE_KIND == "sqlite":
             return self._sqlite_url("sqlite+aiosqlite")
@@ -272,12 +288,12 @@ class Settings(BaseSettings):
         return self._database_url("postgresql+psycopg2")
 
     def _sqlite_url(self, driver: str) -> str:
-        # as_posix: forward slashes work for SQLite on every OS.
+        # as_posix: forward slashes work for SQLite on every OS. No password.
         return URL.create(driver, database=self.SQLITE_FILE.as_posix()).render_as_string(
-            hide_password=False
+            hide_password=True
         )
 
-    def _database_url(self, driver: str) -> str:
+    def _database_url(self, driver: str, *, hide_password: bool = False) -> str:
         return URL.create(
             driver,
             username=self.POSTGRES_USER,
@@ -285,7 +301,7 @@ class Settings(BaseSettings):
             host=self.POSTGRES_HOST,
             port=self.POSTGRES_PORT,
             database=self.POSTGRES_DB,
-        ).render_as_string(hide_password=False)
+        ).render_as_string(hide_password=hide_password)
 
 
 settings = Settings(**profile.settings_overrides())  # type: ignore

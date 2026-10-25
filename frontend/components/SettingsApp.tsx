@@ -15,6 +15,8 @@ declare global {
     openDots?: {
       choosePath(kind: "file" | "folder"): Promise<string | null>;
       nativeControl(request: import("@/components/chat/NativeComputer").NativeRequest): Promise<import("@/components/chat/NativeComputer").NativeStatus | { held: boolean }>;
+      // Optional: the desktop shell raises OS notifications when it offers this.
+      notifications?: { show(payload: { title: string; body: string; threadId: number | null }): void };
     };
   }
 }
